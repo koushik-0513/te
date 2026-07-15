@@ -1,0 +1,15 @@
+services:
+  api:
+    build:
+      context: .
+      target: production
+    ports:
+      - "${PORT:-4000}:4000"
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      MONGODB_URI: ${MONGODB_URI:?Set MONGODB_URI in .env}
+      DB_NAME: ${DB_NAME:-testing-deploymrnt}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      LOG_LEVEL: ${LOG_LEVEL:-combined}
+    restart: unless-stopped
