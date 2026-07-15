@@ -8,7 +8,6 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
   id-token: write
 
 env:
@@ -27,8 +26,8 @@ jobs:
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: arn:aws:iam::063627630243:role/git_pull_push_image_ecr
+          aws-region: ap-southeast-2
 
       - name: Verify AWS identity
         run: aws sts get-caller-identity
