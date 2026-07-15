@@ -23,7 +23,7 @@ env:
   ECS_TASK_FAMILY: business-os-task
   CONTAINER_NAME: business-os-api
   CONTAINER_PORT: "4000"
-  EXECUTION_ROLE_NAME: github-actions-ecs-execution-role
+  EXECUTION_ROLE_NAME: GitHubActionsEcsDeployRole
   LOG_GROUP: /ecs/github-actions-server
 
 jobs:
@@ -37,7 +37,7 @@ jobs:
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::063627630243:role/github-actions-ecs-execution-role
+          role-to-assume: arn:aws:iam::063627630243:role/GitHubActionsEcsDeployRole
           aws-region: ap-southeast-2
 
       - name: Verify AWS identity
