@@ -59,9 +59,9 @@ jobs:
       - name: Configure AWS credentials with GitHub OIDC
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-to-assume: arn:aws:iam::063627630243:role/git_pull_push_image_ecr
           role-session-name: github-actions-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ap-southeast-2
           mask-aws-account-id: true
 
       - name: Log in to Amazon ECR
@@ -78,8 +78,8 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/testing:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/testing:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
