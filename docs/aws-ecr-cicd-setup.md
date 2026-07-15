@@ -113,19 +113,18 @@ the account ID):
 Copy the role ARN, which looks like
 `arn:aws:iam::123456789012:role/GitHubActionsTeEcrPush`.
 
-## 5. Configure GitHub repository variables
+## 5. Confirm the workflow configuration
 
-Open the GitHub repository, then go to **Settings > Secrets and variables >
-Actions > Variables** and create these repository variables:
+The AWS identifiers are hardcoded in `.github/workflows/build-and-push-ecr.yml`:
 
-| Variable | Example | Purpose |
-| --- | --- | --- |
-| `AWS_REGION` | `ap-southeast-2` | Region containing the ECR repository |
-| `ECR_REPOSITORY` | `te` | ECR repository name only, not its full URI |
-| `AWS_ROLE_ARN` | `arn:aws:iam::123456789012:role/GitHubActionsTeEcrPush` | Role assumed through GitHub OIDC |
+| Setting | Value |
+| --- | --- |
+| AWS Region | `ap-southeast-2` |
+| ECR repository | `testing` |
+| IAM role ARN | `arn:aws:iam::063627630243:role/git_pull_push_image_ecr` |
 
-These values are identifiers rather than credentials, so repository variables
-are appropriate. No AWS access-key secrets are required.
+No GitHub repository variables or AWS access-key secrets are required. Update
+the workflow directly if any of these identifiers change.
 
 ## 6. Run and verify the pipeline
 

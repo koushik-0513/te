@@ -17,8 +17,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  AWS_REGION: ap-southeast-2
+  ECR_REPOSITORY: testing
+  AWS_ROLE_ARN: arn:aws:iam::063627630243:role/git_pull_push_image_ecr
 
 jobs:
   validate-image:
@@ -55,27 +56,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Validate AWS configuration
-        env:
-          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
-        run: |
-          if [ -z "$AWS_REGION" ]; then
-            echo "::error::Missing repository variable AWS_REGION"
-            exit 1
-          fi
-          if [ -z "$ECR_REPOSITORY" ]; then
-            echo "::error::Missing repository variable ECR_REPOSITORY"
-            exit 1
-          fi
-          if [ -z "$AWS_ROLE_ARN" ]; then
-            echo "::error::Missing repository variable AWS_ROLE_ARN"
-            exit 1
-          fi
-
       - name: Configure AWS credentials with GitHub OIDC
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
           role-session-name: github-actions-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
