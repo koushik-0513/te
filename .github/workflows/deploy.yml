@@ -11,20 +11,18 @@ permissions:
 
 env:
   AWS_ACCOUNT_ID: "063627630243"
-  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_REGION: ap-southeast-2
 
-  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
 
-  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
-  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
-  ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY }}
+  ECS_SUBNETS: subnet-xxxxxxxx,subnet-yyyyyyyy
+  ECS_SECURITY_GROUPS: sg-xxxxxxxx
 
-  CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
-  CONTAINER_PORT: ${{ vars.CONTAINER_PORT }}
-
-  ECS_SUBNETS: ${{ vars.ECS_SUBNETS }}
-  ECS_SECURITY_GROUPS: ${{ vars.ECS_SECURITY_GROUPS }}
-
+  ECR_REPOSITORY: business-os-api
+  ECS_CLUSTER: business-os-cluster
+  ECS_SERVICE: business-os-service
+  ECS_TASK_FAMILY: business-os-task
+  CONTAINER_NAME: business-os-api
+  CONTAINER_PORT: "4000"
   EXECUTION_ROLE_NAME: github-actions-ecs-execution-role
   LOG_GROUP: /ecs/github-actions-server
 
@@ -39,8 +37,8 @@ jobs:
       - name: Configure AWS credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: github-actions-ecs-execution-role
+          aws-region: ap-southeast-2
 
       - name: Verify AWS identity
         run: aws sts get-caller-identity
