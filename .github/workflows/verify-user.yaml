@@ -32,7 +32,7 @@ env:
   VPC_ID: ${{ secrets.VPC_ID }}
   ECS_SUBNETS: ${{ secrets.ECS_SUBNETS }}
 
-  # AWS Secrets Manager
+  # AWS Secrets Manager secret containing the MongoDB URI
   MONGODB_SECRET_ID: my-api/mongodb-uri
 
   # Load balancer
@@ -42,7 +42,7 @@ env:
   TARGET_GROUP_NAME: business-os-tg
   ALB_LISTENER_PORT: "80"
 
-  # This endpoint must return HTTP 200-399.
+  # Must return HTTP 200-399
   HEALTH_CHECK_PATH: /health
 
 jobs:
@@ -104,7 +104,12 @@ jobs:
             --query 'Subnets[].AvailabilityZone' \
             --output text)"
 
-          UNIQUE_AZ_COUNT="$(printf '%s\n' $SUBNET_AZS | sort -u | wc -l | tr -d ' ')"
+          UNIQUE_AZ_COUNT="$(
+            printf '%s\n' $SUBNET_AZS |
+            sort -u |
+            wc -l |
+            tr -d ' '
+          )"
 
           if [ "$UNIQUE_AZ_COUNT" -lt 2 ]; then
             echo "The ALB requires subnets in at least two Availability Zones."
@@ -335,15 +340,19 @@ jobs:
             echo "ALB security group already exists: $ALB_SG_ID"
           fi
 
-          if ! aws ec2 describe-security-groups \
+          HTTP_RULE_COUNT="$(aws ec2 describe-security-group-rules \
             --region "$AWS_REGION" \
-            --group-ids "$ALB_SG_ID" \
-            --query "SecurityGroups[0].IpPermissions[
-              ?IpProtocol=='tcp' &&
-               FromPort==\`$ALB_LISTENER_PORT\` &&
-               ToPort==\`$ALB_LISTENER_PORT\`
-            ].IpRanges[].CidrIp" \
-            --output text | grep -qw "0.0.0.0/0"; then
+            --filters \
+              "Name=group-id,Values=$ALB_SG_ID" \
+              "Name=ip-permission.protocol,Values=tcp" \
+              "Name=ip-permission.from-port,Values=$ALB_LISTENER_PORT" \
+              "Name=ip-permission.to-port,Values=$ALB_LISTENER_PORT" \
+              "Name=ip-permission.cidr,Values=0.0.0.0/0" \
+            --query 'length(SecurityGroupRules)' \
+            --output text)"
+
+          if [ "$HTTP_RULE_COUNT" = "0" ]; then
+            echo "Adding public HTTP ingress rule."
 
             aws ec2 authorize-security-group-ingress \
               --region "$AWS_REGION" \
@@ -351,6 +360,8 @@ jobs:
               --protocol tcp \
               --port "$ALB_LISTENER_PORT" \
               --cidr 0.0.0.0/0
+          else
+            echo "Public HTTP ingress rule already exists."
           fi
 
           echo "id=$ALB_SG_ID" >> "$GITHUB_OUTPUT"
@@ -391,22 +402,27 @@ jobs:
             echo "ECS task security group already exists: $ECS_SG_ID"
           fi
 
-          EXISTING_SOURCE_SGS="$(aws ec2 describe-security-groups \
+          ECS_RULE_COUNT="$(aws ec2 describe-security-group-rules \
             --region "$AWS_REGION" \
-            --group-ids "$ECS_SG_ID" \
-            --query "SecurityGroups[0].IpPermissions[
-              ?IpProtocol=='tcp' &&
-               FromPort==\`$CONTAINER_PORT\` &&
-               ToPort==\`$CONTAINER_PORT\`
-            ].UserIdGroupPairs[].GroupId" \
+            --filters \
+              "Name=group-id,Values=$ECS_SG_ID" \
+              "Name=ip-permission.protocol,Values=tcp" \
+              "Name=ip-permission.from-port,Values=$CONTAINER_PORT" \
+              "Name=ip-permission.to-port,Values=$CONTAINER_PORT" \
+              "Name=referenced-group-id,Values=$ALB_SG_ID" \
+            --query 'length(SecurityGroupRules)' \
             --output text)"
 
-          if ! grep -qw "$ALB_SG_ID" <<< "$EXISTING_SOURCE_SGS"; then
+          if [ "$ECS_RULE_COUNT" = "0" ]; then
+            echo "Adding ALB-to-ECS ingress rule."
+
             aws ec2 authorize-security-group-ingress \
               --region "$AWS_REGION" \
               --group-id "$ECS_SG_ID" \
               --ip-permissions \
                 "IpProtocol=tcp,FromPort=$CONTAINER_PORT,ToPort=$CONTAINER_PORT,UserIdGroupPairs=[{GroupId=$ALB_SG_ID,Description='Traffic from ALB'}]"
+          else
+            echo "ALB-to-ECS ingress rule already exists."
           fi
 
           echo "id=$ECS_SG_ID" >> "$GITHUB_OUTPUT"
