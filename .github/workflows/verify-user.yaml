@@ -28,20 +28,22 @@ env:
   TASK_EXECUTION_ROLE_NAME: ecsTaskExecutionRole
   LOG_GROUP: /ecs/business-os-api
 
-  # GitHub repository variables
+  # GitHub repository secrets
   VPC_ID: ${{ secrets.VPC_ID }}
   ECS_SUBNETS: ${{ secrets.ECS_SUBNETS }}
 
-  # Load balancer configuration
+  # AWS Secrets Manager
+  MONGODB_SECRET_ID: my-api/mongodb-uri
+
+  # Load balancer
   ALB_NAME: business-os-alb
   ALB_SECURITY_GROUP_NAME: business-os-alb-sg
   ECS_SECURITY_GROUP_NAME: business-os-ecs-sg
-
   TARGET_GROUP_NAME: business-os-tg
   ALB_LISTENER_PORT: "80"
 
-  # Change to /health when your server has a health endpoint.
-  HEALTH_CHECK_PATH: /
+  # This endpoint must return HTTP 200-399.
+  HEALTH_CHECK_PATH: /health
 
 jobs:
   deploy:
@@ -67,23 +69,24 @@ jobs:
           set -euo pipefail
 
           if [ -z "$VPC_ID" ]; then
-            echo "VPC_ID GitHub repository variable is missing."
+            echo "VPC_ID GitHub repository secret is missing."
             exit 1
           fi
 
           if [ -z "$ECS_SUBNETS" ]; then
-            echo "ECS_SUBNETS GitHub repository variable is missing."
+            echo "ECS_SUBNETS GitHub repository secret is missing."
             exit 1
           fi
 
           IFS=',' read -ra SUBNET_ARRAY <<< "$ECS_SUBNETS"
 
           if [ "${#SUBNET_ARRAY[@]}" -lt 2 ]; then
-            echo "At least two subnets are required for the Application Load Balancer."
+            echo "At least two subnets are required for the ALB."
             exit 1
           fi
 
           SUBNET_VPCS="$(aws ec2 describe-subnets \
+            --region "$AWS_REGION" \
             --subnet-ids "${SUBNET_ARRAY[@]}" \
             --query 'Subnets[].VpcId' \
             --output text)"
@@ -95,13 +98,43 @@ jobs:
             fi
           done
 
-          AZ_COUNT="$(aws ec2 describe-subnets \
+          SUBNET_AZS="$(aws ec2 describe-subnets \
+            --region "$AWS_REGION" \
             --subnet-ids "${SUBNET_ARRAY[@]}" \
-            --query 'length(set(Subnets[].AvailabilityZone))' \
-            --output text 2>/dev/null || true)"
+            --query 'Subnets[].AvailabilityZone' \
+            --output text)"
 
+          UNIQUE_AZ_COUNT="$(printf '%s\n' $SUBNET_AZS | sort -u | wc -l | tr -d ' ')"
+
+          if [ "$UNIQUE_AZ_COUNT" -lt 2 ]; then
+            echo "The ALB requires subnets in at least two Availability Zones."
+            exit 1
+          fi
+
+          echo "Networking configuration is valid."
           echo "VPC: $VPC_ID"
           echo "Subnets: $ECS_SUBNETS"
+          echo "Availability Zones: $SUBNET_AZS"
+
+      - name: Resolve MongoDB secret ARN
+        id: mongodb-secret
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MONGODB_SECRET_ARN="$(aws secretsmanager describe-secret \
+            --secret-id "$MONGODB_SECRET_ID" \
+            --region "$AWS_REGION" \
+            --query 'ARN' \
+            --output text)"
+
+          if [ -z "$MONGODB_SECRET_ARN" ] || [ "$MONGODB_SECRET_ARN" = "None" ]; then
+            echo "Could not resolve Secrets Manager secret: $MONGODB_SECRET_ID"
+            exit 1
+          fi
+
+          echo "arn=$MONGODB_SECRET_ARN" >> "$GITHUB_OUTPUT"
+          echo "Resolved Secrets Manager ARN for $MONGODB_SECRET_ID."
 
       - name: Create ECR repository if missing
         shell: bash
@@ -156,6 +189,7 @@ jobs:
           set -euo pipefail
 
           CLUSTER_STATUS="$(aws ecs describe-clusters \
+            --region "$AWS_REGION" \
             --clusters "$ECS_CLUSTER" \
             --query 'clusters[0].status' \
             --output text 2>/dev/null || true)"
@@ -176,6 +210,7 @@ jobs:
           set -euo pipefail
 
           LOG_GROUP_EXISTS="$(aws logs describe-log-groups \
+            --region "$AWS_REGION" \
             --log-group-name-prefix "$LOG_GROUP" \
             --query "logGroups[?logGroupName=='$LOG_GROUP'].logGroupName" \
             --output text)"
@@ -195,9 +230,11 @@ jobs:
               --region "$AWS_REGION"
           fi
 
-      - name: Create ECS task execution role if missing
+      - name: Create or update ECS task execution role
         id: execution-role
         shell: bash
+        env:
+          MONGODB_SECRET_ARN: ${{ steps.mongodb-secret.outputs.arn }}
         run: |
           set -euo pipefail
 
@@ -214,6 +251,7 @@ jobs:
             "Version": "2012-10-17",
             "Statement": [
               {
+                "Sid": "AllowEcsTasks",
                 "Effect": "Allow",
                 "Principal": {
                   "Service": "ecs-tasks.amazonaws.com"
@@ -226,7 +264,8 @@ jobs:
 
             aws iam create-role \
               --role-name "$TASK_EXECUTION_ROLE_NAME" \
-              --assume-role-policy-document file://execution-role-trust-policy.json
+              --assume-role-policy-document \
+                file://execution-role-trust-policy.json
 
             aws iam attach-role-policy \
               --role-name "$TASK_EXECUTION_ROLE_NAME" \
@@ -234,13 +273,34 @@ jobs:
                 arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
           fi
 
+          cat > execution-role-secrets-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "ReadMongoDbSecret",
+                "Effect": "Allow",
+                "Action": [
+                  "secretsmanager:GetSecretValue"
+                ],
+                "Resource": "$MONGODB_SECRET_ARN"
+              }
+            ]
+          }
+          EOF
+
+          aws iam put-role-policy \
+            --role-name "$TASK_EXECUTION_ROLE_NAME" \
+            --policy-name ReadBusinessOsSecrets \
+            --policy-document file://execution-role-secrets-policy.json
+
           EXECUTION_ROLE_ARN="$(aws iam get-role \
             --role-name "$TASK_EXECUTION_ROLE_NAME" \
             --query 'Role.Arn' \
             --output text)"
 
           echo "arn=$EXECUTION_ROLE_ARN" >> "$GITHUB_OUTPUT"
-          echo "Execution role: $EXECUTION_ROLE_ARN"
+          echo "Execution role configured: $EXECUTION_ROLE_ARN"
 
       - name: Create ALB security group
         id: alb-security-group
@@ -249,6 +309,7 @@ jobs:
           set -euo pipefail
 
           ALB_SG_ID="$(aws ec2 describe-security-groups \
+            --region "$AWS_REGION" \
             --filters \
               "Name=vpc-id,Values=$VPC_ID" \
               "Name=group-name,Values=$ALB_SECURITY_GROUP_NAME" \
@@ -259,6 +320,7 @@ jobs:
             echo "Creating ALB security group."
 
             ALB_SG_ID="$(aws ec2 create-security-group \
+              --region "$AWS_REGION" \
               --group-name "$ALB_SECURITY_GROUP_NAME" \
               --description "Allow public HTTP traffic to business-os ALB" \
               --vpc-id "$VPC_ID" \
@@ -266,6 +328,7 @@ jobs:
               --output text)"
 
             aws ec2 create-tags \
+              --region "$AWS_REGION" \
               --resources "$ALB_SG_ID" \
               --tags Key=Name,Value="$ALB_SECURITY_GROUP_NAME"
           else
@@ -273,16 +336,17 @@ jobs:
           fi
 
           if ! aws ec2 describe-security-groups \
+            --region "$AWS_REGION" \
             --group-ids "$ALB_SG_ID" \
             --query "SecurityGroups[0].IpPermissions[
-              ?FromPort==\`$ALB_LISTENER_PORT\` &&
-               ToPort==\`$ALB_LISTENER_PORT\` &&
-               IpProtocol=='tcp' &&
-               IpRanges[?CidrIp=='0.0.0.0/0']
-            ]" \
-            --output text | grep -q .; then
+              ?IpProtocol=='tcp' &&
+               FromPort==\`$ALB_LISTENER_PORT\` &&
+               ToPort==\`$ALB_LISTENER_PORT\`
+            ].IpRanges[].CidrIp" \
+            --output text | grep -qw "0.0.0.0/0"; then
 
             aws ec2 authorize-security-group-ingress \
+              --region "$AWS_REGION" \
               --group-id "$ALB_SG_ID" \
               --protocol tcp \
               --port "$ALB_LISTENER_PORT" \
@@ -301,6 +365,7 @@ jobs:
           set -euo pipefail
 
           ECS_SG_ID="$(aws ec2 describe-security-groups \
+            --region "$AWS_REGION" \
             --filters \
               "Name=vpc-id,Values=$VPC_ID" \
               "Name=group-name,Values=$ECS_SECURITY_GROUP_NAME" \
@@ -311,30 +376,34 @@ jobs:
             echo "Creating ECS task security group."
 
             ECS_SG_ID="$(aws ec2 create-security-group \
+              --region "$AWS_REGION" \
               --group-name "$ECS_SECURITY_GROUP_NAME" \
-              --description "Allow business-os ALB to reach ECS tasks" \
+              --description "Allow ALB to reach business-os ECS tasks" \
               --vpc-id "$VPC_ID" \
               --query 'GroupId' \
               --output text)"
 
             aws ec2 create-tags \
+              --region "$AWS_REGION" \
               --resources "$ECS_SG_ID" \
               --tags Key=Name,Value="$ECS_SECURITY_GROUP_NAME"
           else
             echo "ECS task security group already exists: $ECS_SG_ID"
           fi
 
-          if ! aws ec2 describe-security-groups \
+          EXISTING_SOURCE_SGS="$(aws ec2 describe-security-groups \
+            --region "$AWS_REGION" \
             --group-ids "$ECS_SG_ID" \
             --query "SecurityGroups[0].IpPermissions[
-              ?FromPort==\`$CONTAINER_PORT\` &&
-               ToPort==\`$CONTAINER_PORT\` &&
-               IpProtocol=='tcp' &&
-               UserIdGroupPairs[?GroupId=='$ALB_SG_ID']
-            ]" \
-            --output text | grep -q .; then
+              ?IpProtocol=='tcp' &&
+               FromPort==\`$CONTAINER_PORT\` &&
+               ToPort==\`$CONTAINER_PORT\`
+            ].UserIdGroupPairs[].GroupId" \
+            --output text)"
 
+          if ! grep -qw "$ALB_SG_ID" <<< "$EXISTING_SOURCE_SGS"; then
             aws ec2 authorize-security-group-ingress \
+              --region "$AWS_REGION" \
               --group-id "$ECS_SG_ID" \
               --ip-permissions \
                 "IpProtocol=tcp,FromPort=$CONTAINER_PORT,ToPort=$CONTAINER_PORT,UserIdGroupPairs=[{GroupId=$ALB_SG_ID,Description='Traffic from ALB'}]"
@@ -352,6 +421,7 @@ jobs:
           set -euo pipefail
 
           ALB_ARN="$(aws elbv2 describe-load-balancers \
+            --region "$AWS_REGION" \
             --names "$ALB_NAME" \
             --query 'LoadBalancers[0].LoadBalancerArn' \
             --output text 2>/dev/null || true)"
@@ -362,6 +432,7 @@ jobs:
             IFS=',' read -ra SUBNET_ARRAY <<< "$ECS_SUBNETS"
 
             ALB_ARN="$(aws elbv2 create-load-balancer \
+              --region "$AWS_REGION" \
               --name "$ALB_NAME" \
               --type application \
               --scheme internet-facing \
@@ -373,12 +444,14 @@ jobs:
               --output text)"
 
             aws elbv2 wait load-balancer-available \
+              --region "$AWS_REGION" \
               --load-balancer-arns "$ALB_ARN"
           else
             echo "Application Load Balancer already exists: $ALB_ARN"
           fi
 
           ALB_DNS="$(aws elbv2 describe-load-balancers \
+            --region "$AWS_REGION" \
             --load-balancer-arns "$ALB_ARN" \
             --query 'LoadBalancers[0].DNSName' \
             --output text)"
@@ -389,13 +462,14 @@ jobs:
           echo "ALB ARN: $ALB_ARN"
           echo "ALB DNS: $ALB_DNS"
 
-      - name: Create target group
+      - name: Create or update target group
         id: target-group
         shell: bash
         run: |
           set -euo pipefail
 
           TARGET_GROUP_ARN="$(aws elbv2 describe-target-groups \
+            --region "$AWS_REGION" \
             --names "$TARGET_GROUP_NAME" \
             --query 'TargetGroups[0].TargetGroupArn' \
             --output text 2>/dev/null || true)"
@@ -404,6 +478,7 @@ jobs:
             echo "Creating target group."
 
             TARGET_GROUP_ARN="$(aws elbv2 create-target-group \
+              --region "$AWS_REGION" \
               --name "$TARGET_GROUP_NAME" \
               --protocol HTTP \
               --port "$CONTAINER_PORT" \
@@ -424,17 +499,22 @@ jobs:
             echo "Target group already exists: $TARGET_GROUP_ARN"
 
             aws elbv2 modify-target-group \
+              --region "$AWS_REGION" \
               --target-group-arn "$TARGET_GROUP_ARN" \
               --health-check-protocol HTTP \
               --health-check-port traffic-port \
               --health-check-path "$HEALTH_CHECK_PATH" \
+              --health-check-interval-seconds 30 \
+              --health-check-timeout-seconds 5 \
+              --healthy-threshold-count 2 \
+              --unhealthy-threshold-count 3 \
               --matcher HttpCode=200-399
           fi
 
           echo "arn=$TARGET_GROUP_ARN" >> "$GITHUB_OUTPUT"
           echo "Target group: $TARGET_GROUP_ARN"
 
-      - name: Create ALB listener
+      - name: Create or update ALB listener
         id: listener
         shell: bash
         env:
@@ -444,6 +524,7 @@ jobs:
           set -euo pipefail
 
           LISTENER_ARN="$(aws elbv2 describe-listeners \
+            --region "$AWS_REGION" \
             --load-balancer-arn "$ALB_ARN" \
             --query "Listeners[?Port==\`$ALB_LISTENER_PORT\`].ListenerArn | [0]" \
             --output text 2>/dev/null || true)"
@@ -452,6 +533,7 @@ jobs:
             echo "Creating HTTP listener."
 
             LISTENER_ARN="$(aws elbv2 create-listener \
+              --region "$AWS_REGION" \
               --load-balancer-arn "$ALB_ARN" \
               --protocol HTTP \
               --port "$ALB_LISTENER_PORT" \
@@ -463,6 +545,7 @@ jobs:
             echo "Updating existing HTTP listener."
 
             aws elbv2 modify-listener \
+              --region "$AWS_REGION" \
               --listener-arn "$LISTENER_ARN" \
               --default-actions \
                 "Type=forward,TargetGroupArn=$TARGET_GROUP_ARN"
@@ -477,6 +560,7 @@ jobs:
         env:
           IMAGE_URI: ${{ steps.build-image.outputs.image }}
           EXECUTION_ROLE_ARN: ${{ steps.execution-role.outputs.arn }}
+          MONGODB_SECRET_ARN: ${{ steps.mongodb-secret.outputs.arn }}
         run: |
           set -euo pipefail
 
@@ -499,6 +583,12 @@ jobs:
                 "name": "$CONTAINER_NAME",
                 "image": "$IMAGE_URI",
                 "essential": true,
+                "secrets": [
+                  {
+                    "name": "MONGODB_URI",
+                    "valueFrom": "$MONGODB_SECRET_ARN"
+                  }
+                ],
                 "portMappings": [
                   {
                     "containerPort": $CONTAINER_PORT,
@@ -520,7 +610,10 @@ jobs:
           }
           EOF
 
+          python3 -m json.tool task-definition.json > /dev/null
+
           TASK_DEFINITION_ARN="$(aws ecs register-task-definition \
+            --region "$AWS_REGION" \
             --cli-input-json file://task-definition.json \
             --query 'taskDefinition.taskDefinitionArn' \
             --output text)"
@@ -538,6 +631,7 @@ jobs:
           set -euo pipefail
 
           SERVICE_STATUS="$(aws ecs describe-services \
+            --region "$AWS_REGION" \
             --cluster "$ECS_CLUSTER" \
             --services "$ECS_SERVICE" \
             --query 'services[0].status' \
@@ -551,6 +645,7 @@ jobs:
             echo "Updating ECS service: $ECS_SERVICE"
 
             aws ecs update-service \
+              --region "$AWS_REGION" \
               --cluster "$ECS_CLUSTER" \
               --service "$ECS_SERVICE" \
               --task-definition "$TASK_DEFINITION_ARN" \
@@ -565,6 +660,7 @@ jobs:
             echo "Creating ECS Fargate service: $ECS_SERVICE"
 
             aws ecs create-service \
+              --region "$AWS_REGION" \
               --cluster "$ECS_CLUSTER" \
               --service-name "$ECS_SERVICE" \
               --task-definition "$TASK_DEFINITION_ARN" \
@@ -584,18 +680,21 @@ jobs:
           set -euo pipefail
 
           if ! aws ecs wait services-stable \
+            --region "$AWS_REGION" \
             --cluster "$ECS_CLUSTER" \
             --services "$ECS_SERVICE"; then
 
             echo "ECS service did not become stable."
 
             aws ecs describe-services \
+              --region "$AWS_REGION" \
               --cluster "$ECS_CLUSTER" \
               --services "$ECS_SERVICE" \
               --query 'services[0].events[0:10]' \
               --output table
 
             TASK_ARNS="$(aws ecs list-tasks \
+              --region "$AWS_REGION" \
               --cluster "$ECS_CLUSTER" \
               --service-name "$ECS_SERVICE" \
               --query 'taskArns' \
@@ -603,6 +702,7 @@ jobs:
 
             if [ -n "$TASK_ARNS" ]; then
               aws ecs describe-tasks \
+                --region "$AWS_REGION" \
                 --cluster "$ECS_CLUSTER" \
                 --tasks $TASK_ARNS \
                 --query 'tasks[].{
@@ -630,6 +730,7 @@ jobs:
           set -euo pipefail
 
           aws ecs describe-services \
+            --region "$AWS_REGION" \
             --cluster "$ECS_CLUSTER" \
             --services "$ECS_SERVICE" \
             --query 'services[0].{
@@ -646,6 +747,7 @@ jobs:
           echo "Target health:"
 
           aws elbv2 describe-target-health \
+            --region "$AWS_REGION" \
             --target-group-arn "$TARGET_GROUP_ARN" \
             --query 'TargetHealthDescriptions[].{
               Target:Target.Id,
