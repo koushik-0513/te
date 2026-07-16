@@ -29,8 +29,8 @@ env:
   LOG_GROUP: /ecs/business-os-api
 
   # GitHub repository variables
-  VPC_ID: ${{ vars.VPC_ID }}
-  ECS_SUBNETS: ${{ vars.ECS_SUBNETS }}
+  VPC_ID: ${{ secrets.VPC_ID }}
+  ECS_SUBNETS: ${{ secrets.ECS_SUBNETS }}
 
   # Load balancer configuration
   ALB_NAME: business-os-alb
