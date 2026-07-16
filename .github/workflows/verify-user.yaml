@@ -1,4 +1,4 @@
-name: Build and Push Docker Image to ECR
+name: Deploy to ECS Fargate
 
 on:
   push:
@@ -11,10 +11,40 @@ permissions:
 
 env:
   AWS_REGION: ap-southeast-2
+
   ECR_REPOSITORY: business-os-api
 
+  ECS_CLUSTER: business-os-cluster
+  ECS_SERVICE: business-os-service
+  ECS_TASK_FAMILY: business-os-task
+
+  CONTAINER_NAME: business-os-api
+  CONTAINER_PORT: "4000"
+
+  TASK_CPU: "512"
+  TASK_MEMORY: "1024"
+  DESIRED_COUNT: "1"
+
+  TASK_EXECUTION_ROLE_NAME: ecsTaskExecutionRole
+  LOG_GROUP: /ecs/business-os-api
+
+  # GitHub repository variables
+  VPC_ID: ${{ vars.VPC_ID }}
+  ECS_SUBNETS: ${{ vars.ECS_SUBNETS }}
+
+  # Load balancer configuration
+  ALB_NAME: business-os-alb
+  ALB_SECURITY_GROUP_NAME: business-os-alb-sg
+  ECS_SECURITY_GROUP_NAME: business-os-ecs-sg
+
+  TARGET_GROUP_NAME: business-os-tg
+  ALB_LISTENER_PORT: "80"
+
+  # Change to /health when your server has a health endpoint.
+  HEALTH_CHECK_PATH: /
+
 jobs:
-  build-and-push:
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
@@ -31,23 +61,66 @@ jobs:
       - name: Verify AWS identity
         run: aws sts get-caller-identity
 
-      - name: Create ECR repository if it does not exist
+      - name: Validate networking configuration
         shell: bash
         run: |
+          set -euo pipefail
+
+          if [ -z "$VPC_ID" ]; then
+            echo "VPC_ID GitHub repository variable is missing."
+            exit 1
+          fi
+
+          if [ -z "$ECS_SUBNETS" ]; then
+            echo "ECS_SUBNETS GitHub repository variable is missing."
+            exit 1
+          fi
+
+          IFS=',' read -ra SUBNET_ARRAY <<< "$ECS_SUBNETS"
+
+          if [ "${#SUBNET_ARRAY[@]}" -lt 2 ]; then
+            echo "At least two subnets are required for the Application Load Balancer."
+            exit 1
+          fi
+
+          SUBNET_VPCS="$(aws ec2 describe-subnets \
+            --subnet-ids "${SUBNET_ARRAY[@]}" \
+            --query 'Subnets[].VpcId' \
+            --output text)"
+
+          for SUBNET_VPC in $SUBNET_VPCS; do
+            if [ "$SUBNET_VPC" != "$VPC_ID" ]; then
+              echo "A supplied subnet does not belong to VPC $VPC_ID."
+              exit 1
+            fi
+          done
+
+          AZ_COUNT="$(aws ec2 describe-subnets \
+            --subnet-ids "${SUBNET_ARRAY[@]}" \
+            --query 'length(set(Subnets[].AvailabilityZone))' \
+            --output text 2>/dev/null || true)"
+
+          echo "VPC: $VPC_ID"
+          echo "Subnets: $ECS_SUBNETS"
+
+      - name: Create ECR repository if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
           if aws ecr describe-repositories \
             --repository-names "$ECR_REPOSITORY" \
             --region "$AWS_REGION" > /dev/null 2>&1; then
-            echo "ECR repository '$ECR_REPOSITORY' already exists."
+
+            echo "ECR repository already exists: $ECR_REPOSITORY"
           else
-            echo "ECR repository '$ECR_REPOSITORY' does not exist. Creating it..."
+            echo "Creating ECR repository: $ECR_REPOSITORY"
 
             aws ecr create-repository \
               --repository-name "$ECR_REPOSITORY" \
               --region "$AWS_REGION" \
               --image-scanning-configuration scanOnPush=true \
               --image-tag-mutability MUTABLE
-
-            echo "ECR repository '$ECR_REPOSITORY' created."
           fi
 
       - name: Log in to Amazon ECR
@@ -55,20 +128,533 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push Docker image
+        id: build-image
+        shell: bash
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY"
+          set -euo pipefail
+
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          LATEST_IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
           docker build \
-            --tag "$IMAGE_URI:$IMAGE_TAG" \
-            --tag "$IMAGE_URI:latest" \
+            --tag "$IMAGE_URI" \
+            --tag "$LATEST_IMAGE_URI" \
             .
 
-          docker push "$IMAGE_URI:$IMAGE_TAG"
-          docker push "$IMAGE_URI:latest"
+          docker push "$IMAGE_URI"
+          docker push "$LATEST_IMAGE_URI"
 
-          echo "Docker images pushed successfully:"
-          echo "$IMAGE_URI:$IMAGE_TAG"
-          echo "$IMAGE_URI:latest"
+          echo "image=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+          echo "Pushed image: $IMAGE_URI"
+
+      - name: Create ECS cluster if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CLUSTER_STATUS="$(aws ecs describe-clusters \
+            --clusters "$ECS_CLUSTER" \
+            --query 'clusters[0].status' \
+            --output text 2>/dev/null || true)"
+
+          if [ "$CLUSTER_STATUS" = "ACTIVE" ]; then
+            echo "ECS cluster already exists: $ECS_CLUSTER"
+          else
+            echo "Creating ECS cluster: $ECS_CLUSTER"
+
+            aws ecs create-cluster \
+              --cluster-name "$ECS_CLUSTER" \
+              --region "$AWS_REGION"
+          fi
+
+      - name: Create CloudWatch log group if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LOG_GROUP_EXISTS="$(aws logs describe-log-groups \
+            --log-group-name-prefix "$LOG_GROUP" \
+            --query "logGroups[?logGroupName=='$LOG_GROUP'].logGroupName" \
+            --output text)"
+
+          if [ "$LOG_GROUP_EXISTS" = "$LOG_GROUP" ]; then
+            echo "CloudWatch log group already exists: $LOG_GROUP"
+          else
+            echo "Creating CloudWatch log group: $LOG_GROUP"
+
+            aws logs create-log-group \
+              --log-group-name "$LOG_GROUP" \
+              --region "$AWS_REGION"
+
+            aws logs put-retention-policy \
+              --log-group-name "$LOG_GROUP" \
+              --retention-in-days 14 \
+              --region "$AWS_REGION"
+          fi
+
+      - name: Create ECS task execution role if missing
+        id: execution-role
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if aws iam get-role \
+            --role-name "$TASK_EXECUTION_ROLE_NAME" \
+            > /dev/null 2>&1; then
+
+            echo "Task execution role already exists: $TASK_EXECUTION_ROLE_NAME"
+          else
+            echo "Creating task execution role: $TASK_EXECUTION_ROLE_NAME"
+
+            cat > execution-role-trust-policy.json <<'EOF'
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "ecs-tasks.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+              }
+            ]
+          }
+          EOF
+
+            aws iam create-role \
+              --role-name "$TASK_EXECUTION_ROLE_NAME" \
+              --assume-role-policy-document file://execution-role-trust-policy.json
+
+            aws iam attach-role-policy \
+              --role-name "$TASK_EXECUTION_ROLE_NAME" \
+              --policy-arn \
+                arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+          fi
+
+          EXECUTION_ROLE_ARN="$(aws iam get-role \
+            --role-name "$TASK_EXECUTION_ROLE_NAME" \
+            --query 'Role.Arn' \
+            --output text)"
+
+          echo "arn=$EXECUTION_ROLE_ARN" >> "$GITHUB_OUTPUT"
+          echo "Execution role: $EXECUTION_ROLE_ARN"
+
+      - name: Create ALB security group
+        id: alb-security-group
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ALB_SG_ID="$(aws ec2 describe-security-groups \
+            --filters \
+              "Name=vpc-id,Values=$VPC_ID" \
+              "Name=group-name,Values=$ALB_SECURITY_GROUP_NAME" \
+            --query 'SecurityGroups[0].GroupId' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$ALB_SG_ID" ] || [ "$ALB_SG_ID" = "None" ]; then
+            echo "Creating ALB security group."
+
+            ALB_SG_ID="$(aws ec2 create-security-group \
+              --group-name "$ALB_SECURITY_GROUP_NAME" \
+              --description "Allow public HTTP traffic to business-os ALB" \
+              --vpc-id "$VPC_ID" \
+              --query 'GroupId' \
+              --output text)"
+
+            aws ec2 create-tags \
+              --resources "$ALB_SG_ID" \
+              --tags Key=Name,Value="$ALB_SECURITY_GROUP_NAME"
+          else
+            echo "ALB security group already exists: $ALB_SG_ID"
+          fi
+
+          if ! aws ec2 describe-security-groups \
+            --group-ids "$ALB_SG_ID" \
+            --query "SecurityGroups[0].IpPermissions[
+              ?FromPort==\`$ALB_LISTENER_PORT\` &&
+               ToPort==\`$ALB_LISTENER_PORT\` &&
+               IpProtocol=='tcp' &&
+               IpRanges[?CidrIp=='0.0.0.0/0']
+            ]" \
+            --output text | grep -q .; then
+
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$ALB_SG_ID" \
+              --protocol tcp \
+              --port "$ALB_LISTENER_PORT" \
+              --cidr 0.0.0.0/0
+          fi
+
+          echo "id=$ALB_SG_ID" >> "$GITHUB_OUTPUT"
+          echo "ALB security group: $ALB_SG_ID"
+
+      - name: Create ECS task security group
+        id: ecs-security-group
+        shell: bash
+        env:
+          ALB_SG_ID: ${{ steps.alb-security-group.outputs.id }}
+        run: |
+          set -euo pipefail
+
+          ECS_SG_ID="$(aws ec2 describe-security-groups \
+            --filters \
+              "Name=vpc-id,Values=$VPC_ID" \
+              "Name=group-name,Values=$ECS_SECURITY_GROUP_NAME" \
+            --query 'SecurityGroups[0].GroupId' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$ECS_SG_ID" ] || [ "$ECS_SG_ID" = "None" ]; then
+            echo "Creating ECS task security group."
+
+            ECS_SG_ID="$(aws ec2 create-security-group \
+              --group-name "$ECS_SECURITY_GROUP_NAME" \
+              --description "Allow business-os ALB to reach ECS tasks" \
+              --vpc-id "$VPC_ID" \
+              --query 'GroupId' \
+              --output text)"
+
+            aws ec2 create-tags \
+              --resources "$ECS_SG_ID" \
+              --tags Key=Name,Value="$ECS_SECURITY_GROUP_NAME"
+          else
+            echo "ECS task security group already exists: $ECS_SG_ID"
+          fi
+
+          if ! aws ec2 describe-security-groups \
+            --group-ids "$ECS_SG_ID" \
+            --query "SecurityGroups[0].IpPermissions[
+              ?FromPort==\`$CONTAINER_PORT\` &&
+               ToPort==\`$CONTAINER_PORT\` &&
+               IpProtocol=='tcp' &&
+               UserIdGroupPairs[?GroupId=='$ALB_SG_ID']
+            ]" \
+            --output text | grep -q .; then
+
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$ECS_SG_ID" \
+              --ip-permissions \
+                "IpProtocol=tcp,FromPort=$CONTAINER_PORT,ToPort=$CONTAINER_PORT,UserIdGroupPairs=[{GroupId=$ALB_SG_ID,Description='Traffic from ALB'}]"
+          fi
+
+          echo "id=$ECS_SG_ID" >> "$GITHUB_OUTPUT"
+          echo "ECS task security group: $ECS_SG_ID"
+
+      - name: Create Application Load Balancer
+        id: load-balancer
+        shell: bash
+        env:
+          ALB_SG_ID: ${{ steps.alb-security-group.outputs.id }}
+        run: |
+          set -euo pipefail
+
+          ALB_ARN="$(aws elbv2 describe-load-balancers \
+            --names "$ALB_NAME" \
+            --query 'LoadBalancers[0].LoadBalancerArn' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$ALB_ARN" ] || [ "$ALB_ARN" = "None" ]; then
+            echo "Creating Application Load Balancer."
+
+            IFS=',' read -ra SUBNET_ARRAY <<< "$ECS_SUBNETS"
+
+            ALB_ARN="$(aws elbv2 create-load-balancer \
+              --name "$ALB_NAME" \
+              --type application \
+              --scheme internet-facing \
+              --ip-address-type ipv4 \
+              --subnets "${SUBNET_ARRAY[@]}" \
+              --security-groups "$ALB_SG_ID" \
+              --tags Key=Name,Value="$ALB_NAME" \
+              --query 'LoadBalancers[0].LoadBalancerArn' \
+              --output text)"
+
+            aws elbv2 wait load-balancer-available \
+              --load-balancer-arns "$ALB_ARN"
+          else
+            echo "Application Load Balancer already exists: $ALB_ARN"
+          fi
+
+          ALB_DNS="$(aws elbv2 describe-load-balancers \
+            --load-balancer-arns "$ALB_ARN" \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)"
+
+          echo "arn=$ALB_ARN" >> "$GITHUB_OUTPUT"
+          echo "dns=$ALB_DNS" >> "$GITHUB_OUTPUT"
+
+          echo "ALB ARN: $ALB_ARN"
+          echo "ALB DNS: $ALB_DNS"
+
+      - name: Create target group
+        id: target-group
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_GROUP_ARN="$(aws elbv2 describe-target-groups \
+            --names "$TARGET_GROUP_NAME" \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$TARGET_GROUP_ARN" ] || [ "$TARGET_GROUP_ARN" = "None" ]; then
+            echo "Creating target group."
+
+            TARGET_GROUP_ARN="$(aws elbv2 create-target-group \
+              --name "$TARGET_GROUP_NAME" \
+              --protocol HTTP \
+              --port "$CONTAINER_PORT" \
+              --target-type ip \
+              --vpc-id "$VPC_ID" \
+              --health-check-protocol HTTP \
+              --health-check-port traffic-port \
+              --health-check-path "$HEALTH_CHECK_PATH" \
+              --health-check-interval-seconds 30 \
+              --health-check-timeout-seconds 5 \
+              --healthy-threshold-count 2 \
+              --unhealthy-threshold-count 3 \
+              --matcher HttpCode=200-399 \
+              --tags Key=Name,Value="$TARGET_GROUP_NAME" \
+              --query 'TargetGroups[0].TargetGroupArn' \
+              --output text)"
+          else
+            echo "Target group already exists: $TARGET_GROUP_ARN"
+
+            aws elbv2 modify-target-group \
+              --target-group-arn "$TARGET_GROUP_ARN" \
+              --health-check-protocol HTTP \
+              --health-check-port traffic-port \
+              --health-check-path "$HEALTH_CHECK_PATH" \
+              --matcher HttpCode=200-399
+          fi
+
+          echo "arn=$TARGET_GROUP_ARN" >> "$GITHUB_OUTPUT"
+          echo "Target group: $TARGET_GROUP_ARN"
+
+      - name: Create ALB listener
+        id: listener
+        shell: bash
+        env:
+          ALB_ARN: ${{ steps.load-balancer.outputs.arn }}
+          TARGET_GROUP_ARN: ${{ steps.target-group.outputs.arn }}
+        run: |
+          set -euo pipefail
+
+          LISTENER_ARN="$(aws elbv2 describe-listeners \
+            --load-balancer-arn "$ALB_ARN" \
+            --query "Listeners[?Port==\`$ALB_LISTENER_PORT\`].ListenerArn | [0]" \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$LISTENER_ARN" ] || [ "$LISTENER_ARN" = "None" ]; then
+            echo "Creating HTTP listener."
+
+            LISTENER_ARN="$(aws elbv2 create-listener \
+              --load-balancer-arn "$ALB_ARN" \
+              --protocol HTTP \
+              --port "$ALB_LISTENER_PORT" \
+              --default-actions \
+                "Type=forward,TargetGroupArn=$TARGET_GROUP_ARN" \
+              --query 'Listeners[0].ListenerArn' \
+              --output text)"
+          else
+            echo "Updating existing HTTP listener."
+
+            aws elbv2 modify-listener \
+              --listener-arn "$LISTENER_ARN" \
+              --default-actions \
+                "Type=forward,TargetGroupArn=$TARGET_GROUP_ARN"
+          fi
+
+          echo "arn=$LISTENER_ARN" >> "$GITHUB_OUTPUT"
+          echo "Listener: $LISTENER_ARN"
+
+      - name: Register ECS task definition
+        id: task-definition
+        shell: bash
+        env:
+          IMAGE_URI: ${{ steps.build-image.outputs.image }}
+          EXECUTION_ROLE_ARN: ${{ steps.execution-role.outputs.arn }}
+        run: |
+          set -euo pipefail
+
+          cat > task-definition.json <<EOF
+          {
+            "family": "$ECS_TASK_FAMILY",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": [
+              "FARGATE"
+            ],
+            "cpu": "$TASK_CPU",
+            "memory": "$TASK_MEMORY",
+            "executionRoleArn": "$EXECUTION_ROLE_ARN",
+            "runtimePlatform": {
+              "operatingSystemFamily": "LINUX",
+              "cpuArchitecture": "X86_64"
+            },
+            "containerDefinitions": [
+              {
+                "name": "$CONTAINER_NAME",
+                "image": "$IMAGE_URI",
+                "essential": true,
+                "portMappings": [
+                  {
+                    "containerPort": $CONTAINER_PORT,
+                    "hostPort": $CONTAINER_PORT,
+                    "protocol": "tcp",
+                    "name": "${CONTAINER_NAME}-${CONTAINER_PORT}-tcp"
+                  }
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "$LOG_GROUP",
+                    "awslogs-region": "$AWS_REGION",
+                    "awslogs-stream-prefix": "ecs"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+
+          TASK_DEFINITION_ARN="$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)"
+
+          echo "arn=$TASK_DEFINITION_ARN" >> "$GITHUB_OUTPUT"
+          echo "Registered task definition: $TASK_DEFINITION_ARN"
+
+      - name: Create or update ECS service
+        shell: bash
+        env:
+          TASK_DEFINITION_ARN: ${{ steps.task-definition.outputs.arn }}
+          TARGET_GROUP_ARN: ${{ steps.target-group.outputs.arn }}
+          ECS_SG_ID: ${{ steps.ecs-security-group.outputs.id }}
+        run: |
+          set -euo pipefail
+
+          SERVICE_STATUS="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].status' \
+            --output text 2>/dev/null || true)"
+
+          NETWORK_CONFIGURATION="awsvpcConfiguration={subnets=[$ECS_SUBNETS],securityGroups=[$ECS_SG_ID],assignPublicIp=ENABLED}"
+
+          LOAD_BALANCER_CONFIGURATION="targetGroupArn=$TARGET_GROUP_ARN,containerName=$CONTAINER_NAME,containerPort=$CONTAINER_PORT"
+
+          if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+            echo "Updating ECS service: $ECS_SERVICE"
+
+            aws ecs update-service \
+              --cluster "$ECS_CLUSTER" \
+              --service "$ECS_SERVICE" \
+              --task-definition "$TASK_DEFINITION_ARN" \
+              --desired-count "$DESIRED_COUNT" \
+              --network-configuration "$NETWORK_CONFIGURATION" \
+              --load-balancers "$LOAD_BALANCER_CONFIGURATION" \
+              --health-check-grace-period-seconds 60 \
+              --force-new-deployment \
+              --deployment-configuration \
+                "deploymentCircuitBreaker={enable=true,rollback=true},maximumPercent=200,minimumHealthyPercent=100"
+          else
+            echo "Creating ECS Fargate service: $ECS_SERVICE"
+
+            aws ecs create-service \
+              --cluster "$ECS_CLUSTER" \
+              --service-name "$ECS_SERVICE" \
+              --task-definition "$TASK_DEFINITION_ARN" \
+              --desired-count "$DESIRED_COUNT" \
+              --launch-type FARGATE \
+              --platform-version LATEST \
+              --network-configuration "$NETWORK_CONFIGURATION" \
+              --load-balancers "$LOAD_BALANCER_CONFIGURATION" \
+              --health-check-grace-period-seconds 60 \
+              --deployment-configuration \
+                "deploymentCircuitBreaker={enable=true,rollback=true},maximumPercent=200,minimumHealthyPercent=100"
+          fi
+
+      - name: Wait for ECS service to become stable
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"; then
+
+            echo "ECS service did not become stable."
+
+            aws ecs describe-services \
+              --cluster "$ECS_CLUSTER" \
+              --services "$ECS_SERVICE" \
+              --query 'services[0].events[0:10]' \
+              --output table
+
+            TASK_ARNS="$(aws ecs list-tasks \
+              --cluster "$ECS_CLUSTER" \
+              --service-name "$ECS_SERVICE" \
+              --query 'taskArns' \
+              --output text)"
+
+            if [ -n "$TASK_ARNS" ]; then
+              aws ecs describe-tasks \
+                --cluster "$ECS_CLUSTER" \
+                --tasks $TASK_ARNS \
+                --query 'tasks[].{
+                  Task:taskArn,
+                  LastStatus:lastStatus,
+                  DesiredStatus:desiredStatus,
+                  StopCode:stopCode,
+                  StoppedReason:stoppedReason,
+                  Containers:containers[].reason
+                }' \
+                --output json
+            fi
+
+            exit 1
+          fi
+
+          echo "ECS service deployment completed successfully."
+
+      - name: Show deployment information
+        shell: bash
+        env:
+          ALB_DNS: ${{ steps.load-balancer.outputs.dns }}
+          TARGET_GROUP_ARN: ${{ steps.target-group.outputs.arn }}
+        run: |
+          set -euo pipefail
+
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].{
+              Service:serviceName,
+              Status:status,
+              Desired:desiredCount,
+              Running:runningCount,
+              Pending:pendingCount,
+              TaskDefinition:taskDefinition,
+              LaunchType:launchType
+            }' \
+            --output table
+
+          echo "Target health:"
+
+          aws elbv2 describe-target-health \
+            --target-group-arn "$TARGET_GROUP_ARN" \
+            --query 'TargetHealthDescriptions[].{
+              Target:Target.Id,
+              Port:Target.Port,
+              State:TargetHealth.State,
+              Reason:TargetHealth.Reason,
+              Description:TargetHealth.Description
+            }' \
+            --output table
+
+          echo "Application URL:"
+          echo "http://$ALB_DNS"
