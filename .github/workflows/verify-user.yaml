@@ -42,7 +42,7 @@ env:
   TARGET_GROUP_NAME: business-os-tg
   ALB_LISTENER_PORT: "80"
 
-  # Must return HTTP 200-399
+  # This route must return HTTP 200-399
   HEALTH_CHECK_PATH: /health
 
 jobs:
@@ -342,24 +342,23 @@ jobs:
 
           HTTP_RULE_COUNT="$(aws ec2 describe-security-group-rules \
             --region "$AWS_REGION" \
-            --filters \
-              "Name=group-id,Values=$ALB_SG_ID" \
-              "Name=ip-permission.protocol,Values=tcp" \
-              "Name=ip-permission.from-port,Values=$ALB_LISTENER_PORT" \
-              "Name=ip-permission.to-port,Values=$ALB_LISTENER_PORT" \
-              "Name=ip-permission.cidr,Values=0.0.0.0/0" \
-            --query 'length(SecurityGroupRules)' \
+            --filters "Name=group-id,Values=$ALB_SG_ID" \
+            --query "length(SecurityGroupRules[?IsEgress==\`false\` && IpProtocol=='tcp' && FromPort==\`$ALB_LISTENER_PORT\` && ToPort==\`$ALB_LISTENER_PORT\` && CidrIpv4=='0.0.0.0/0'])" \
             --output text)"
 
           if [ "$HTTP_RULE_COUNT" = "0" ]; then
             echo "Adding public HTTP ingress rule."
 
-            aws ec2 authorize-security-group-ingress \
+            if ! aws ec2 authorize-security-group-ingress \
               --region "$AWS_REGION" \
               --group-id "$ALB_SG_ID" \
               --protocol tcp \
               --port "$ALB_LISTENER_PORT" \
-              --cidr 0.0.0.0/0
+              --cidr 0.0.0.0/0; then
+
+              echo "Could not add the ALB ingress rule."
+              exit 1
+            fi
           else
             echo "Public HTTP ingress rule already exists."
           fi
@@ -404,23 +403,22 @@ jobs:
 
           ECS_RULE_COUNT="$(aws ec2 describe-security-group-rules \
             --region "$AWS_REGION" \
-            --filters \
-              "Name=group-id,Values=$ECS_SG_ID" \
-              "Name=ip-permission.protocol,Values=tcp" \
-              "Name=ip-permission.from-port,Values=$CONTAINER_PORT" \
-              "Name=ip-permission.to-port,Values=$CONTAINER_PORT" \
-              "Name=referenced-group-id,Values=$ALB_SG_ID" \
-            --query 'length(SecurityGroupRules)' \
+            --filters "Name=group-id,Values=$ECS_SG_ID" \
+            --query "length(SecurityGroupRules[?IsEgress==\`false\` && IpProtocol=='tcp' && FromPort==\`$CONTAINER_PORT\` && ToPort==\`$CONTAINER_PORT\` && ReferencedGroupInfo.GroupId=='$ALB_SG_ID'])" \
             --output text)"
 
           if [ "$ECS_RULE_COUNT" = "0" ]; then
             echo "Adding ALB-to-ECS ingress rule."
 
-            aws ec2 authorize-security-group-ingress \
+            if ! aws ec2 authorize-security-group-ingress \
               --region "$AWS_REGION" \
               --group-id "$ECS_SG_ID" \
               --ip-permissions \
-                "IpProtocol=tcp,FromPort=$CONTAINER_PORT,ToPort=$CONTAINER_PORT,UserIdGroupPairs=[{GroupId=$ALB_SG_ID,Description='Traffic from ALB'}]"
+                "IpProtocol=tcp,FromPort=$CONTAINER_PORT,ToPort=$CONTAINER_PORT,UserIdGroupPairs=[{GroupId=$ALB_SG_ID,Description='Traffic from ALB'}]"; then
+
+              echo "Could not add the ALB-to-ECS ingress rule."
+              exit 1
+            fi
           else
             echo "ALB-to-ECS ingress rule already exists."
           fi
@@ -709,28 +707,68 @@ jobs:
               --query 'services[0].events[0:10]' \
               --output table
 
-            TASK_ARNS="$(aws ecs list-tasks \
+            RUNNING_TASK_ARNS="$(aws ecs list-tasks \
               --region "$AWS_REGION" \
               --cluster "$ECS_CLUSTER" \
               --service-name "$ECS_SERVICE" \
+              --desired-status RUNNING \
               --query 'taskArns' \
               --output text)"
 
-            if [ -n "$TASK_ARNS" ]; then
+            STOPPED_TASK_ARNS="$(aws ecs list-tasks \
+              --region "$AWS_REGION" \
+              --cluster "$ECS_CLUSTER" \
+              --service-name "$ECS_SERVICE" \
+              --desired-status STOPPED \
+              --query 'taskArns' \
+              --output text)"
+
+            if [ -n "$RUNNING_TASK_ARNS" ]; then
+              echo "Running tasks:"
+
               aws ecs describe-tasks \
                 --region "$AWS_REGION" \
                 --cluster "$ECS_CLUSTER" \
-                --tasks $TASK_ARNS \
+                --tasks $RUNNING_TASK_ARNS \
                 --query 'tasks[].{
                   Task:taskArn,
                   LastStatus:lastStatus,
                   DesiredStatus:desiredStatus,
-                  StopCode:stopCode,
-                  StoppedReason:stoppedReason,
-                  Containers:containers[].reason
+                  Containers:containers[].{
+                    Name:name,
+                    LastStatus:lastStatus,
+                    Reason:reason
+                  }
                 }' \
                 --output json
             fi
+
+            if [ -n "$STOPPED_TASK_ARNS" ]; then
+              echo "Stopped tasks:"
+
+              aws ecs describe-tasks \
+                --region "$AWS_REGION" \
+                --cluster "$ECS_CLUSTER" \
+                --tasks $STOPPED_TASK_ARNS \
+                --query 'tasks[].{
+                  Task:taskArn,
+                  LastStatus:lastStatus,
+                  StopCode:stopCode,
+                  StoppedReason:stoppedReason,
+                  Containers:containers[].{
+                    Name:name,
+                    ExitCode:exitCode,
+                    Reason:reason
+                  }
+                }' \
+                --output json
+            fi
+
+            echo "Recent application logs:"
+
+            aws logs tail "$LOG_GROUP" \
+              --region "$AWS_REGION" \
+              --since 10m || true
 
             exit 1
           fi
