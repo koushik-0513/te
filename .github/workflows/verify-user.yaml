@@ -1,4 +1,4 @@
-name: Deploy to ECS
+name: Build and Push Docker Image to ECR
 
 on:
   push:
@@ -9,8 +9,12 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: ap-southeast-2
+  ECR_REPOSITORY: business-os-api
+
 jobs:
-  deploy:
+  build-and-push:
     runs-on: ubuntu-latest
 
     steps:
@@ -21,7 +25,50 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::063627630243:role/github-actions-ecs-deployment-role
-          aws-region: ap-southeast-2
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-${{ github.run_id }}
 
       - name: Verify AWS identity
         run: aws sts get-caller-identity
+
+      - name: Create ECR repository if it does not exist
+        shell: bash
+        run: |
+          if aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" > /dev/null 2>&1; then
+            echo "ECR repository '$ECR_REPOSITORY' already exists."
+          else
+            echo "ECR repository '$ECR_REPOSITORY' does not exist. Creating it..."
+
+            aws ecr create-repository \
+              --repository-name "$ECR_REPOSITORY" \
+              --region "$AWS_REGION" \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability MUTABLE
+
+            echo "ECR repository '$ECR_REPOSITORY' created."
+          fi
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY"
+
+          docker build \
+            --tag "$IMAGE_URI:$IMAGE_TAG" \
+            --tag "$IMAGE_URI:latest" \
+            .
+
+          docker push "$IMAGE_URI:$IMAGE_TAG"
+          docker push "$IMAGE_URI:latest"
+
+          echo "Docker images pushed successfully:"
+          echo "$IMAGE_URI:$IMAGE_TAG"
+          echo "$IMAGE_URI:latest"
