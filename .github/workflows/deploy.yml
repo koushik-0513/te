@@ -1,0 +1,358 @@
+name: Build and Deploy to ECS Fargate
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "infrastructure/configuration-values.yaml"
+      - ".github/workflows/server-configuration.yml"
+      - "**/*.md"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: ecs-deployment-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install YAML parser
+        run: python3 -m pip install --disable-pip-version-check pyyaml
+
+      - name: Load configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          config = yaml.safe_load(
+              Path("infrastructure/configuration-values.yaml").read_text()
+          )
+
+          values = {
+              "AWS_REGION": config["aws"]["region"],
+              "AWS_DEPLOYMENT_ROLE_ARN": config["aws"]["deployment_role_arn"],
+              "ECR_REPOSITORY": config["ecr"]["repository"],
+              "ECS_CLUSTER": config["ecs"]["cluster"],
+              "ECS_SERVICE": config["ecs"]["service"],
+              "ECS_TASK_FAMILY": config["ecs"]["task_family"],
+              "DESIRED_COUNT": str(config["ecs"]["desired_count"]),
+              "PLATFORM_VERSION": config["ecs"]["platform_version"],
+              "TASK_CPU": str(config["ecs"]["task_cpu"]),
+              "TASK_MEMORY": str(config["ecs"]["task_memory"]),
+              "CONTAINER_NAME": config["ecs"]["container_name"],
+              "CONTAINER_PORT": str(config["ecs"]["container_port"]),
+              "HEALTH_CHECK_GRACE_PERIOD": str(
+                  config["ecs"]["health_check_grace_period_seconds"]
+              ),
+              "ASSIGN_PUBLIC_IP": config["network"]["assign_public_ip"],
+              "LOG_GROUP": config["logging"]["log_group"],
+              "LOG_STREAM_PREFIX": config["logging"]["stream_prefix"],
+              "TASK_EXECUTION_ROLE_NAME": config["iam"]["task_execution_role_name"],
+              "MONGODB_SECRET_ID": config["secrets"]["mongodb_secret_id"],
+              "MONGODB_ENV_NAME": config["secrets"]["mongodb_environment_name"],
+              "ECS_SECURITY_GROUP_NAME": config["load_balancer"]["ecs_security_group_name"],
+              "TARGET_GROUP_NAME": config["load_balancer"]["target_group_name"],
+          }
+
+          with open(os.environ["GITHUB_ENV"], "a") as env_file:
+              for key, value in values.items():
+                  env_file.write(f"{key}={value}\n")
+          PY
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOYMENT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubDeploy-${{ github.run_id }}
+
+      - name: Load networking secrets
+        shell: bash
+        env:
+          VPC_ID: ${{ secrets.VPC_ID }}
+          ECS_SUBNETS: ${{ secrets.ECS_SUBNETS }}
+        run: |
+          set -euo pipefail
+
+          [ -n "$VPC_ID" ] || {
+            echo "VPC_ID repository secret is missing."
+            exit 1
+          }
+
+          [ -n "$ECS_SUBNETS" ] || {
+            echo "ECS_SUBNETS repository secret is missing."
+            exit 1
+          }
+
+          echo "VPC_ID=$VPC_ID" >> "$GITHUB_ENV"
+          echo "ECS_SUBNETS=$ECS_SUBNETS" >> "$GITHUB_ENV"
+
+      - name: Verify infrastructure exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CLUSTER_STATUS="$(aws ecs describe-clusters \
+            --region "$AWS_REGION" \
+            --clusters "$ECS_CLUSTER" \
+            --query 'clusters[0].status' \
+            --output text 2>/dev/null || true)"
+
+          if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
+            echo "ECS infrastructure is not configured."
+            echo "Run the Configure AWS ECS Infrastructure workflow first."
+            exit 1
+          fi
+
+          aws ecr describe-repositories \
+            --region "$AWS_REGION" \
+            --repository-names "$ECR_REPOSITORY" >/dev/null
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build-image
+        shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          LATEST_IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+          docker build \
+            --tag "$IMAGE_URI" \
+            --tag "$LATEST_IMAGE_URI" \
+            .
+
+          docker push "$IMAGE_URI"
+          docker push "$LATEST_IMAGE_URI"
+
+          echo "image=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve deployment resources
+        id: resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXECUTION_ROLE_ARN="$(aws iam get-role \
+            --role-name "$TASK_EXECUTION_ROLE_NAME" \
+            --query 'Role.Arn' \
+            --output text)"
+
+          MONGODB_SECRET_ARN="$(aws secretsmanager describe-secret \
+            --secret-id "$MONGODB_SECRET_ID" \
+            --region "$AWS_REGION" \
+            --query 'ARN' \
+            --output text)"
+
+          ECS_SG_ID="$(aws ec2 describe-security-groups \
+            --region "$AWS_REGION" \
+            --filters \
+              "Name=vpc-id,Values=$VPC_ID" \
+              "Name=group-name,Values=$ECS_SECURITY_GROUP_NAME" \
+            --query 'SecurityGroups[0].GroupId' \
+            --output text)"
+
+          TARGET_GROUP_ARN="$(aws elbv2 describe-target-groups \
+            --region "$AWS_REGION" \
+            --names "$TARGET_GROUP_NAME" \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text)"
+
+          for VALUE in \
+            "$EXECUTION_ROLE_ARN" \
+            "$MONGODB_SECRET_ARN" \
+            "$ECS_SG_ID" \
+            "$TARGET_GROUP_ARN"; do
+            if [ -z "$VALUE" ] || [ "$VALUE" = "None" ]; then
+              echo "A required infrastructure resource could not be resolved."
+              echo "Run the infrastructure workflow first."
+              exit 1
+            fi
+          done
+
+          echo "execution_role_arn=$EXECUTION_ROLE_ARN" >> "$GITHUB_OUTPUT"
+          echo "mongodb_secret_arn=$MONGODB_SECRET_ARN" >> "$GITHUB_OUTPUT"
+          echo "ecs_sg_id=$ECS_SG_ID" >> "$GITHUB_OUTPUT"
+          echo "target_group_arn=$TARGET_GROUP_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Register ECS task definition
+        id: task-definition
+        shell: bash
+        env:
+          IMAGE_URI: ${{ steps.build-image.outputs.image }}
+          EXECUTION_ROLE_ARN: ${{ steps.resources.outputs.execution_role_arn }}
+          MONGODB_SECRET_ARN: ${{ steps.resources.outputs.mongodb_secret_arn }}
+        run: |
+          set -euo pipefail
+
+          cat > task-definition.json <<EOF
+          {
+            "family": "$ECS_TASK_FAMILY",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "$TASK_CPU",
+            "memory": "$TASK_MEMORY",
+            "executionRoleArn": "$EXECUTION_ROLE_ARN",
+            "runtimePlatform": {
+              "operatingSystemFamily": "LINUX",
+              "cpuArchitecture": "X86_64"
+            },
+            "containerDefinitions": [
+              {
+                "name": "$CONTAINER_NAME",
+                "image": "$IMAGE_URI",
+                "essential": true,
+                "secrets": [
+                  {
+                    "name": "$MONGODB_ENV_NAME",
+                    "valueFrom": "$MONGODB_SECRET_ARN"
+                  }
+                ],
+                "portMappings": [
+                  {
+                    "containerPort": $CONTAINER_PORT,
+                    "hostPort": $CONTAINER_PORT,
+                    "protocol": "tcp"
+                  }
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "$LOG_GROUP",
+                    "awslogs-region": "$AWS_REGION",
+                    "awslogs-stream-prefix": "$LOG_STREAM_PREFIX"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+
+          python3 -m json.tool task-definition.json >/dev/null
+
+          TASK_DEFINITION_ARN="$(aws ecs register-task-definition \
+            --region "$AWS_REGION" \
+            --cli-input-json file://task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)"
+
+          echo "arn=$TASK_DEFINITION_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update ECS service
+        shell: bash
+        env:
+          TASK_DEFINITION_ARN: ${{ steps.task-definition.outputs.arn }}
+          TARGET_GROUP_ARN: ${{ steps.resources.outputs.target_group_arn }}
+          ECS_SG_ID: ${{ steps.resources.outputs.ecs_sg_id }}
+        run: |
+          set -euo pipefail
+
+          SERVICE_STATUS="$(aws ecs describe-services \
+            --region "$AWS_REGION" \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].status' \
+            --output text 2>/dev/null || true)"
+
+          NETWORK_CONFIGURATION="awsvpcConfiguration={subnets=[$ECS_SUBNETS],securityGroups=[$ECS_SG_ID],assignPublicIp=$ASSIGN_PUBLIC_IP}"
+          LOAD_BALANCER_CONFIGURATION="targetGroupArn=$TARGET_GROUP_ARN,containerName=$CONTAINER_NAME,containerPort=$CONTAINER_PORT"
+          DEPLOYMENT_CONFIGURATION="deploymentCircuitBreaker={enable=true,rollback=true},maximumPercent=200,minimumHealthyPercent=100"
+
+          if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+            aws ecs update-service \
+              --region "$AWS_REGION" \
+              --cluster "$ECS_CLUSTER" \
+              --service "$ECS_SERVICE" \
+              --task-definition "$TASK_DEFINITION_ARN" \
+              --desired-count "$DESIRED_COUNT" \
+              --network-configuration "$NETWORK_CONFIGURATION" \
+              --load-balancers "$LOAD_BALANCER_CONFIGURATION" \
+              --health-check-grace-period-seconds "$HEALTH_CHECK_GRACE_PERIOD" \
+              --force-new-deployment \
+              --deployment-configuration "$DEPLOYMENT_CONFIGURATION"
+          else
+            aws ecs create-service \
+              --region "$AWS_REGION" \
+              --cluster "$ECS_CLUSTER" \
+              --service-name "$ECS_SERVICE" \
+              --task-definition "$TASK_DEFINITION_ARN" \
+              --desired-count "$DESIRED_COUNT" \
+              --launch-type FARGATE \
+              --platform-version "$PLATFORM_VERSION" \
+              --network-configuration "$NETWORK_CONFIGURATION" \
+              --load-balancers "$LOAD_BALANCER_CONFIGURATION" \
+              --health-check-grace-period-seconds "$HEALTH_CHECK_GRACE_PERIOD" \
+              --deployment-configuration "$DEPLOYMENT_CONFIGURATION"
+          fi
+
+      - name: Wait for ECS service to become stable
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! aws ecs wait services-stable \
+            --region "$AWS_REGION" \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"; then
+
+            aws ecs describe-services \
+              --region "$AWS_REGION" \
+              --cluster "$ECS_CLUSTER" \
+              --services "$ECS_SERVICE" \
+              --query 'services[0].events[0:10]' \
+              --output table
+
+            aws logs tail "$LOG_GROUP" \
+              --region "$AWS_REGION" \
+              --since 10m || true
+
+            exit 1
+          fi
+
+      - name: Show deployment information
+        shell: bash
+        env:
+          TARGET_GROUP_ARN: ${{ steps.resources.outputs.target_group_arn }}
+        run: |
+          set -euo pipefail
+
+          aws ecs describe-services \
+            --region "$AWS_REGION" \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].{
+              Service:serviceName,
+              Status:status,
+              Desired:desiredCount,
+              Running:runningCount,
+              Pending:pendingCount,
+              TaskDefinition:taskDefinition
+            }' \
+            --output table
+
+          aws elbv2 describe-target-health \
+            --region "$AWS_REGION" \
+            --target-group-arn "$TARGET_GROUP_ARN" \
+            --output table

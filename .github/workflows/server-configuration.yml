@@ -1,0 +1,455 @@
+name: Configure AWS ECS Infrastructure
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "infrastructure/configuration-values.yaml"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: ecs-infrastructure-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install YAML parser
+        run: python3 -m pip install --disable-pip-version-check pyyaml
+
+      - name: Load configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          config = yaml.safe_load(
+              Path("infrastructure/configuration-values.yaml").read_text()
+          )
+
+          values = {
+              "AWS_REGION": config["aws"]["region"],
+              "AWS_DEPLOYMENT_ROLE_ARN": config["aws"]["deployment_role_arn"],
+              "VPC_ID_SECRET_NAME": config["network"]["vpc_id_secret_name"],
+              "SUBNET_IDS_SECRET_NAME": config["network"]["subnet_ids_secret_name"],
+              "ECR_REPOSITORY": config["ecr"]["repository"],
+              "ECR_SCAN_ON_PUSH": str(config["ecr"]["scan_on_push"]).lower(),
+              "ECR_TAG_MUTABILITY": config["ecr"]["image_tag_mutability"],
+              "ECS_CLUSTER": config["ecs"]["cluster"],
+              "CONTAINER_PORT": str(config["ecs"]["container_port"]),
+              "LOG_GROUP": config["logging"]["log_group"],
+              "LOG_RETENTION_DAYS": str(config["logging"]["retention_days"]),
+              "TASK_EXECUTION_ROLE_NAME": config["iam"]["task_execution_role_name"],
+              "SECRET_POLICY_NAME": config["iam"]["inline_secret_policy_name"],
+              "MONGODB_SECRET_ID": config["secrets"]["mongodb_secret_id"],
+              "ALB_NAME": config["load_balancer"]["name"],
+              "ALB_SCHEME": config["load_balancer"]["scheme"],
+              "ALB_LISTENER_PORT": str(config["load_balancer"]["listener_port"]),
+              "ALB_SECURITY_GROUP_NAME": config["load_balancer"]["alb_security_group_name"],
+              "ECS_SECURITY_GROUP_NAME": config["load_balancer"]["ecs_security_group_name"],
+              "TARGET_GROUP_NAME": config["load_balancer"]["target_group_name"],
+              "HEALTH_CHECK_PATH": config["load_balancer"]["health_check_path"],
+          }
+
+          with open(os.environ["GITHUB_ENV"], "a") as env_file:
+              for key, value in values.items():
+                  env_file.write(f"{key}={value}\n")
+          PY
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOYMENT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubInfra-${{ github.run_id }}
+
+      - name: Validate required repository secrets
+        shell: bash
+        env:
+          VPC_ID: ${{ secrets.VPC_ID }}
+          ECS_SUBNETS: ${{ secrets.ECS_SUBNETS }}
+        run: |
+          set -euo pipefail
+
+          [ -n "$VPC_ID" ] || {
+            echo "VPC_ID repository secret is missing."
+            exit 1
+          }
+
+          [ -n "$ECS_SUBNETS" ] || {
+            echo "ECS_SUBNETS repository secret is missing."
+            exit 1
+          }
+
+          echo "VPC_ID=$VPC_ID" >> "$GITHUB_ENV"
+          echo "ECS_SUBNETS=$ECS_SUBNETS" >> "$GITHUB_ENV"
+
+      - name: Validate networking configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IFS=',' read -ra SUBNET_ARRAY <<< "$ECS_SUBNETS"
+
+          if [ "${#SUBNET_ARRAY[@]}" -lt 2 ]; then
+            echo "At least two subnets are required for the ALB."
+            exit 1
+          fi
+
+          SUBNET_VPCS="$(aws ec2 describe-subnets \
+            --region "$AWS_REGION" \
+            --subnet-ids "${SUBNET_ARRAY[@]}" \
+            --query 'Subnets[].VpcId' \
+            --output text)"
+
+          for SUBNET_VPC in $SUBNET_VPCS; do
+            if [ "$SUBNET_VPC" != "$VPC_ID" ]; then
+              echo "A supplied subnet does not belong to VPC $VPC_ID."
+              exit 1
+            fi
+          done
+
+          SUBNET_AZS="$(aws ec2 describe-subnets \
+            --region "$AWS_REGION" \
+            --subnet-ids "${SUBNET_ARRAY[@]}" \
+            --query 'Subnets[].AvailabilityZone' \
+            --output text)"
+
+          UNIQUE_AZ_COUNT="$(
+            printf '%s\n' $SUBNET_AZS |
+            sort -u |
+            wc -l |
+            tr -d ' '
+          )"
+
+          if [ "$UNIQUE_AZ_COUNT" -lt 2 ]; then
+            echo "The ALB requires subnets in at least two Availability Zones."
+            exit 1
+          fi
+
+      - name: Resolve MongoDB secret ARN
+        id: mongodb-secret
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SECRET_ARN="$(aws secretsmanager describe-secret \
+            --secret-id "$MONGODB_SECRET_ID" \
+            --region "$AWS_REGION" \
+            --query 'ARN' \
+            --output text)"
+
+          echo "arn=$SECRET_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Create ECR repository if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "ECR repository already exists: $ECR_REPOSITORY"
+          else
+            aws ecr create-repository \
+              --repository-name "$ECR_REPOSITORY" \
+              --region "$AWS_REGION" \
+              --image-scanning-configuration "scanOnPush=$ECR_SCAN_ON_PUSH" \
+              --image-tag-mutability "$ECR_TAG_MUTABILITY"
+          fi
+
+      - name: Create ECS cluster if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          STATUS="$(aws ecs describe-clusters \
+            --region "$AWS_REGION" \
+            --clusters "$ECS_CLUSTER" \
+            --query 'clusters[0].status' \
+            --output text 2>/dev/null || true)"
+
+          if [ "$STATUS" != "ACTIVE" ]; then
+            aws ecs create-cluster \
+              --cluster-name "$ECS_CLUSTER" \
+              --region "$AWS_REGION"
+          fi
+
+      - name: Create or update CloudWatch log group
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXISTS="$(aws logs describe-log-groups \
+            --region "$AWS_REGION" \
+            --log-group-name-prefix "$LOG_GROUP" \
+            --query "logGroups[?logGroupName=='$LOG_GROUP'].logGroupName" \
+            --output text)"
+
+          if [ "$EXISTS" != "$LOG_GROUP" ]; then
+            aws logs create-log-group \
+              --log-group-name "$LOG_GROUP" \
+              --region "$AWS_REGION"
+          fi
+
+          aws logs put-retention-policy \
+            --log-group-name "$LOG_GROUP" \
+            --retention-in-days "$LOG_RETENTION_DAYS" \
+            --region "$AWS_REGION"
+
+      - name: Create or update ECS task execution role
+        shell: bash
+        env:
+          MONGODB_SECRET_ARN: ${{ steps.mongodb-secret.outputs.arn }}
+        run: |
+          set -euo pipefail
+
+          if ! aws iam get-role \
+            --role-name "$TASK_EXECUTION_ROLE_NAME" >/dev/null 2>&1; then
+
+            cat > execution-role-trust-policy.json <<'EOF'
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "ecs-tasks.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+              }
+            ]
+          }
+          EOF
+
+            aws iam create-role \
+              --role-name "$TASK_EXECUTION_ROLE_NAME" \
+              --assume-role-policy-document file://execution-role-trust-policy.json
+
+            aws iam attach-role-policy \
+              --role-name "$TASK_EXECUTION_ROLE_NAME" \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+          fi
+
+          cat > execution-role-secrets-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": "$MONGODB_SECRET_ARN"
+              }
+            ]
+          }
+          EOF
+
+          aws iam put-role-policy \
+            --role-name "$TASK_EXECUTION_ROLE_NAME" \
+            --policy-name "$SECRET_POLICY_NAME" \
+            --policy-document file://execution-role-secrets-policy.json
+
+      - name: Create or update security groups
+        id: security-groups
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ALB_SG_ID="$(aws ec2 describe-security-groups \
+            --region "$AWS_REGION" \
+            --filters \
+              "Name=vpc-id,Values=$VPC_ID" \
+              "Name=group-name,Values=$ALB_SECURITY_GROUP_NAME" \
+            --query 'SecurityGroups[0].GroupId' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$ALB_SG_ID" ] || [ "$ALB_SG_ID" = "None" ]; then
+            ALB_SG_ID="$(aws ec2 create-security-group \
+              --region "$AWS_REGION" \
+              --group-name "$ALB_SECURITY_GROUP_NAME" \
+              --description "Public traffic to application ALB" \
+              --vpc-id "$VPC_ID" \
+              --query 'GroupId' \
+              --output text)"
+          fi
+
+          ALB_RULE_COUNT="$(aws ec2 describe-security-group-rules \
+            --region "$AWS_REGION" \
+            --filters "Name=group-id,Values=$ALB_SG_ID" \
+            --query "length(SecurityGroupRules[?IsEgress==\`false\` && IpProtocol=='tcp' && FromPort==\`$ALB_LISTENER_PORT\` && ToPort==\`$ALB_LISTENER_PORT\` && CidrIpv4=='0.0.0.0/0'])" \
+            --output text)"
+
+          if [ "$ALB_RULE_COUNT" = "0" ]; then
+            aws ec2 authorize-security-group-ingress \
+              --region "$AWS_REGION" \
+              --group-id "$ALB_SG_ID" \
+              --protocol tcp \
+              --port "$ALB_LISTENER_PORT" \
+              --cidr 0.0.0.0/0
+          fi
+
+          ECS_SG_ID="$(aws ec2 describe-security-groups \
+            --region "$AWS_REGION" \
+            --filters \
+              "Name=vpc-id,Values=$VPC_ID" \
+              "Name=group-name,Values=$ECS_SECURITY_GROUP_NAME" \
+            --query 'SecurityGroups[0].GroupId' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$ECS_SG_ID" ] || [ "$ECS_SG_ID" = "None" ]; then
+            ECS_SG_ID="$(aws ec2 create-security-group \
+              --region "$AWS_REGION" \
+              --group-name "$ECS_SECURITY_GROUP_NAME" \
+              --description "Traffic from ALB to ECS tasks" \
+              --vpc-id "$VPC_ID" \
+              --query 'GroupId' \
+              --output text)"
+          fi
+
+          ECS_RULE_COUNT="$(aws ec2 describe-security-group-rules \
+            --region "$AWS_REGION" \
+            --filters "Name=group-id,Values=$ECS_SG_ID" \
+            --query "length(SecurityGroupRules[?IsEgress==\`false\` && IpProtocol=='tcp' && FromPort==\`$CONTAINER_PORT\` && ToPort==\`$CONTAINER_PORT\` && ReferencedGroupInfo.GroupId=='$ALB_SG_ID'])" \
+            --output text)"
+
+          if [ "$ECS_RULE_COUNT" = "0" ]; then
+            aws ec2 authorize-security-group-ingress \
+              --region "$AWS_REGION" \
+              --group-id "$ECS_SG_ID" \
+              --ip-permissions \
+                "IpProtocol=tcp,FromPort=$CONTAINER_PORT,ToPort=$CONTAINER_PORT,UserIdGroupPairs=[{GroupId=$ALB_SG_ID,Description='Traffic from ALB'}]"
+          fi
+
+          echo "alb_sg_id=$ALB_SG_ID" >> "$GITHUB_OUTPUT"
+          echo "ecs_sg_id=$ECS_SG_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Create Application Load Balancer if missing
+        id: load-balancer
+        shell: bash
+        env:
+          ALB_SG_ID: ${{ steps.security-groups.outputs.alb_sg_id }}
+        run: |
+          set -euo pipefail
+
+          ALB_ARN="$(aws elbv2 describe-load-balancers \
+            --region "$AWS_REGION" \
+            --names "$ALB_NAME" \
+            --query 'LoadBalancers[0].LoadBalancerArn' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$ALB_ARN" ] || [ "$ALB_ARN" = "None" ]; then
+            IFS=',' read -ra SUBNET_ARRAY <<< "$ECS_SUBNETS"
+
+            ALB_ARN="$(aws elbv2 create-load-balancer \
+              --region "$AWS_REGION" \
+              --name "$ALB_NAME" \
+              --type application \
+              --scheme "$ALB_SCHEME" \
+              --ip-address-type ipv4 \
+              --subnets "${SUBNET_ARRAY[@]}" \
+              --security-groups "$ALB_SG_ID" \
+              --query 'LoadBalancers[0].LoadBalancerArn' \
+              --output text)"
+
+            aws elbv2 wait load-balancer-available \
+              --region "$AWS_REGION" \
+              --load-balancer-arns "$ALB_ARN"
+          fi
+
+          echo "arn=$ALB_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update target group
+        id: target-group
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_GROUP_ARN="$(aws elbv2 describe-target-groups \
+            --region "$AWS_REGION" \
+            --names "$TARGET_GROUP_NAME" \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$TARGET_GROUP_ARN" ] || [ "$TARGET_GROUP_ARN" = "None" ]; then
+            TARGET_GROUP_ARN="$(aws elbv2 create-target-group \
+              --region "$AWS_REGION" \
+              --name "$TARGET_GROUP_NAME" \
+              --protocol HTTP \
+              --port "$CONTAINER_PORT" \
+              --target-type ip \
+              --vpc-id "$VPC_ID" \
+              --health-check-protocol HTTP \
+              --health-check-port traffic-port \
+              --health-check-path "$HEALTH_CHECK_PATH" \
+              --matcher HttpCode=200-399 \
+              --query 'TargetGroups[0].TargetGroupArn' \
+              --output text)"
+          else
+            aws elbv2 modify-target-group \
+              --region "$AWS_REGION" \
+              --target-group-arn "$TARGET_GROUP_ARN" \
+              --health-check-protocol HTTP \
+              --health-check-port traffic-port \
+              --health-check-path "$HEALTH_CHECK_PATH" \
+              --matcher HttpCode=200-399
+          fi
+
+          echo "arn=$TARGET_GROUP_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update ALB listener
+        shell: bash
+        env:
+          ALB_ARN: ${{ steps.load-balancer.outputs.arn }}
+          TARGET_GROUP_ARN: ${{ steps.target-group.outputs.arn }}
+        run: |
+          set -euo pipefail
+
+          LISTENER_ARN="$(aws elbv2 describe-listeners \
+            --region "$AWS_REGION" \
+            --load-balancer-arn "$ALB_ARN" \
+            --query "Listeners[?Port==\`$ALB_LISTENER_PORT\`].ListenerArn | [0]" \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$LISTENER_ARN" ] || [ "$LISTENER_ARN" = "None" ]; then
+            aws elbv2 create-listener \
+              --region "$AWS_REGION" \
+              --load-balancer-arn "$ALB_ARN" \
+              --protocol HTTP \
+              --port "$ALB_LISTENER_PORT" \
+              --default-actions "Type=forward,TargetGroupArn=$TARGET_GROUP_ARN"
+          else
+            aws elbv2 modify-listener \
+              --region "$AWS_REGION" \
+              --listener-arn "$LISTENER_ARN" \
+              --default-actions "Type=forward,TargetGroupArn=$TARGET_GROUP_ARN"
+          fi
+
+      - name: Show infrastructure information
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ALB_DNS="$(aws elbv2 describe-load-balancers \
+            --region "$AWS_REGION" \
+            --names "$ALB_NAME" \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)"
+
+          echo "Infrastructure configuration completed."
+          echo "Cluster: $ECS_CLUSTER"
+          echo "ECR repository: $ECR_REPOSITORY"
+          echo "Application URL: http://$ALB_DNS"
