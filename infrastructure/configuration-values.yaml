@@ -1,51 +1,99 @@
-environment: stage
+# Shared settings must stay identical in stage and production so production can
+# deploy the exact ECR image that was built and verified in stage.
+shared:
+  aws:
+    region: ap-southeast-2
+    
+  ecr:
+    repository: business-os-api
+    # Source-based tags are never overwritten. Production resolves the digest
+    # that was previously published by the stage branch.
+    image_tag_mutability: IMMUTABLE
+    scan_on_push: true
 
-aws:
-  region: ap-southeast-2
-  deployment_role_arn: arn:aws:iam::063627630243:role/github-actions-ecs-deployment-role
+environments:
+  stage:
+    aws: 
+      deployment_role_arn: arn:aws:iam::063627630243:role/github-actions-ecs-deployment-role
+    
+    network:
+      # VPC_ID and ECS_SUBNETS come from the GitHub environment named "stage".
+      assign_public_ip: ENABLED
 
-network:
-  # Keep sensitive/account-specific IDs in GitHub secrets.
-  vpc_id_secret_name: VPC_ID
-  subnet_ids_secret_name: ECS_SUBNETS
-  assign_public_ip: ENABLED
+    ecs:
+      cluster: business-os-stage-cluster
+      service: business-os--api-stage-service
+      task_family: business-os-api-stage-task
+      desired_count: 1
+      launch_type: FARGATE
+      platform_version: LATEST
+      task_cpu: 512
+      task_memory: 1024
+      container_name: business-os-api
+      container_port: 4000
+      health_check_grace_period_seconds: 60
 
-ecr:
-  repository: business-os-api
-  image_tag_mutability: MUTABLE
-  scan_on_push: true
+    logging:
+      log_group: /ecs/business-os-api
+      retention_days: 14
+      stream_prefix: ecs
 
-ecs:
-  cluster: business-os-cluster
-  service: business-os-service
-  task_family: business-os-task
-  desired_count: 1
-  launch_type: FARGATE
-  platform_version: LATEST
-  task_cpu: 512
-  task_memory: 1024
-  container_name: business-os-api
-  container_port: 4000
-  health_check_grace_period_seconds: 60
+    iam:
+      task_execution_role_name: ecsTaskExecutionRoleStage
+      inline_secret_policy_name: ReadBusinessOsSecretsStage
 
-logging:
-  log_group: /ecs/business-os-api
-  retention_days: 14
-  stream_prefix: ecs
+    secrets:
+      mongodb_secret_id: my-api/mongodb-uri
+      mongodb_environment_name: MONGODB_URI
 
-iam:
-  task_execution_role_name: ecsTaskExecutionRole
-  inline_secret_policy_name: ReadBusinessOsSecrets
+    load_balancer:
+      name: business-os-stage-alb
+      scheme: internet-facing
+      listener_port: 80
+      alb_security_group_name: business-os-stage-alb-sg
+      ecs_security_group_name: business-os-stage-ecs-sg
+      target_group_name: business-os-stage-tg
+      health_check_path: /health
 
-secrets:
-  mongodb_secret_id: my-api/mongodb-uri
-  mongodb_environment_name: MONGODB_URI
+  prod:
+    aws:
+      deployment_role_arn: arn:aws:iam::063627630243:role/ecs-deployment-role-prod
 
-load_balancer:
-  name: business-os-alb
-  scheme: internet-facing
-  listener_port: 80
-  alb_security_group_name: business-os-alb-sg
-  ecs_security_group_name: business-os-ecs-sg
-  target_group_name: business-os-tg
-  health_check_path: /health
+    network:
+      # VPC_ID and ECS_SUBNETS come from the GitHub environment named "prod".
+      assign_public_ip: ENABLED
+
+    ecs:
+      cluster: business-os-prod-cluster
+      service: business-os-prod-service
+      task_family: business-os-prod-task
+      desired_count: 1
+      launch_type: FARGATE
+      platform_version: LATEST
+      task_cpu: 512
+      task_memory: 1024
+      container_name: business-os-api
+      container_port: 4000
+      health_check_grace_period_seconds: 60
+
+    logging:
+      log_group: /ecs/business-os-api-prod
+      retention_days: 30
+      stream_prefix: ecs
+
+    iam:
+      task_execution_role_name: ecsTaskExecutionRoleProd
+      inline_secret_policy_name: ReadBusinessOsProdSecrets
+
+    secrets:
+      mongodb_secret_id: my-api/prod/mongodb-uri
+      mongodb_environment_name: MONGODB_URI
+
+    load_balancer:
+      name: business-os-prod-alb
+      scheme: internet-facing
+      listener_port: 80
+      alb_security_group_name: business-os-prod-alb-sg
+      ecs_security_group_name: business-os-prod-ecs-sg
+      target_group_name: business-os-prod-tg
+      health_check_path: /health

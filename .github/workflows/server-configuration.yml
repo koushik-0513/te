@@ -4,25 +4,50 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - stage
       - main
     paths:
       - "infrastructure/configuration-values.yaml"
+      - ".github/workflows/server-configuration.yml"
 
 permissions:
   id-token: write
   contents: read
 
 concurrency:
-  group: ecs-infrastructure-${{ github.ref }}
+  group: ecs-infrastructure-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   configure:
+    if: github.ref_name == 'stage' || github.ref_name == 'main'
     runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.ref_name == 'main' && 'prod' || 'stage' }}
+    env:
+      DEPLOY_ENV: ${{ github.ref_name == 'main' && 'prod' || 'stage' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Validate infrastructure branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$GITHUB_REF_NAME" in
+            stage)
+              [ "$DEPLOY_ENV" = "stage" ]
+              ;;
+            main)
+              [ "$DEPLOY_ENV" = "prod" ]
+              ;;
+            *)
+              echo "Only the stage and main branches can configure infrastructure."
+              exit 1
+              ;;
+          esac
 
       - name: Install YAML parser
         run: python3 -m pip install --disable-pip-version-check pyyaml
@@ -37,18 +62,19 @@ jobs:
           from pathlib import Path
           import yaml
 
-          config = yaml.safe_load(
+          root = yaml.safe_load(
               Path("infrastructure/configuration-values.yaml").read_text()
           )
+          deploy_environment = os.environ["DEPLOY_ENV"]
+          shared = root["shared"]
+          config = root["environments"][deploy_environment]
 
           values = {
-              "AWS_REGION": config["aws"]["region"],
+              "AWS_REGION": shared["aws"]["region"],
               "AWS_DEPLOYMENT_ROLE_ARN": config["aws"]["deployment_role_arn"],
-              "VPC_ID_SECRET_NAME": config["network"]["vpc_id_secret_name"],
-              "SUBNET_IDS_SECRET_NAME": config["network"]["subnet_ids_secret_name"],
-              "ECR_REPOSITORY": config["ecr"]["repository"],
-              "ECR_SCAN_ON_PUSH": str(config["ecr"]["scan_on_push"]).lower(),
-              "ECR_TAG_MUTABILITY": config["ecr"]["image_tag_mutability"],
+              "ECR_REPOSITORY": shared["ecr"]["repository"],
+              "ECR_SCAN_ON_PUSH": str(shared["ecr"]["scan_on_push"]).lower(),
+              "ECR_TAG_MUTABILITY": shared["ecr"]["image_tag_mutability"],
               "ECS_CLUSTER": config["ecs"]["cluster"],
               "CONTAINER_PORT": str(config["ecs"]["container_port"]),
               "LOG_GROUP": config["logging"]["log_group"],
@@ -73,11 +99,11 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::063627630243:role/github-actions-ecs-deployment-role
+          role-to-assume: ${{ env.AWS_DEPLOYMENT_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubInfra-${{ github.run_id }}
 
-      - name: Validate required repository secrets
+      - name: Load environment networking secrets
         shell: bash
         env:
           VPC_ID: ${{ secrets.VPC_ID }}
@@ -86,12 +112,12 @@ jobs:
           set -euo pipefail
 
           [ -n "$VPC_ID" ] || {
-            echo "VPC_ID repository secret is missing."
+            echo "VPC_ID is missing from the $DEPLOY_ENV GitHub environment."
             exit 1
           }
 
           [ -n "$ECS_SUBNETS" ] || {
-            echo "ECS_SUBNETS repository secret is missing."
+            echo "ECS_SUBNETS is missing from the $DEPLOY_ENV GitHub environment."
             exit 1
           }
 
@@ -171,6 +197,16 @@ jobs:
               --image-scanning-configuration "scanOnPush=$ECR_SCAN_ON_PUSH" \
               --image-tag-mutability "$ECR_TAG_MUTABILITY"
           fi
+
+          aws ecr put-image-tag-mutability \
+            --repository-name "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" \
+            --image-tag-mutability "$ECR_TAG_MUTABILITY" >/dev/null
+
+          aws ecr put-image-scanning-configuration \
+            --repository-name "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" \
+            --image-scanning-configuration "scanOnPush=$ECR_SCAN_ON_PUSH" >/dev/null
 
       - name: Create ECS cluster if missing
         shell: bash
@@ -450,6 +486,7 @@ jobs:
             --output text)"
 
           echo "Infrastructure configuration completed."
+          echo "Environment: $DEPLOY_ENV"
           echo "Cluster: $ECS_CLUSTER"
           echo "ECR repository: $ECR_REPOSITORY"
           echo "Application URL: http://$ALB_DNS"
