@@ -1,14 +1,8 @@
 name: Configure AWS ECS Infrastructure
 
 on:
+  workflow_call:
   workflow_dispatch:
-  push:
-    branches:
-      - stage
-      - main
-    paths:
-      - "infrastructure/configuration-values.yaml"
-      - ".github/workflows/server-configuration.yml"
 
 permissions:
   id-token: write

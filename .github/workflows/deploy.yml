@@ -6,8 +6,6 @@ on:
       - stage
       - main
     paths-ignore:
-      - "infrastructure/configuration-values.yaml"
-      - ".github/workflows/server-configuration.yml"
       - "**/*.md"
   workflow_dispatch:
 
@@ -20,8 +18,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  configure:
+    if: github.ref_name == 'stage' || github.ref_name == 'main'
+    uses: ./.github/workflows/server-configuration.yml
+    secrets: inherit
+
   deploy:
     if: github.ref_name == 'stage' || github.ref_name == 'main'
+    needs: configure
     runs-on: ubuntu-latest
     environment:
       name: ${{ github.ref_name == 'main' && 'prod' || 'stage' }}
