@@ -8,6 +8,12 @@ on:
     paths-ignore:
       - "**/*.md"
   workflow_dispatch:
+    inputs:
+      configure_infrastructure:
+        description: Run infrastructure configuration before deployment
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   id-token: write
@@ -18,14 +24,68 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  configure:
+  configuration_changes:
     if: github.ref_name == 'stage' || github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    outputs:
+      configuration_changed: ${{ steps.changes.outputs.configuration_changed }}
+
+    steps:
+      - name: Checkout repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect infrastructure configuration changes
+        id: changes
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          FORCE_CONFIGURATION: ${{ inputs.configure_infrastructure }}
+        run: |
+          set -euo pipefail
+
+          CONFIGURATION_CHANGED=false
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$FORCE_CONFIGURATION" = "true" ]; then
+              CONFIGURATION_CHANGED=true
+            fi
+          else
+            if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+              CHANGED_FILES="$(git show --pretty='' --name-only "$GITHUB_SHA")"
+            else
+              CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA")"
+            fi
+
+            while IFS= read -r CHANGED_FILE; do
+              case "$CHANGED_FILE" in
+                infrastructure/configuration-values.yaml|.github/workflows/server-configuration.yml)
+                  CONFIGURATION_CHANGED=true
+                  break
+                  ;;
+              esac
+            done <<< "$CHANGED_FILES"
+          fi
+
+          echo "configuration_changed=$CONFIGURATION_CHANGED" >> "$GITHUB_OUTPUT"
+          echo "Infrastructure configuration changed: $CONFIGURATION_CHANGED"
+
+  configure:
+    needs: configuration_changes
+    if: needs.configuration_changes.outputs.configuration_changed == 'true'
     uses: ./.github/workflows/server-configuration.yml
     secrets: inherit
 
   deploy:
-    if: github.ref_name == 'stage' || github.ref_name == 'main'
-    needs: configure
+    needs:
+      - configuration_changes
+      - configure
+    if: |
+      always() &&
+      (github.ref_name == 'stage' || github.ref_name == 'main') &&
+      needs.configuration_changes.result == 'success' &&
+      (needs.configure.result == 'success' || needs.configure.result == 'skipped')
     runs-on: ubuntu-latest
     environment:
       name: ${{ github.ref_name == 'main' && 'prod' || 'stage' }}
